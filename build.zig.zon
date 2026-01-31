@@ -1,0 +1,14 @@
+.{
+    .name = .sphws,
+    .version = "0.0.1",
+    .fingerprint = 0xfcd998b1c3205596,
+    .dependencies = .{
+        .sphtud = .{ .path = "sphtud" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "sphtud",
+        "src",
+    },
+}
