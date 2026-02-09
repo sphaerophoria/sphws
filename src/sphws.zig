@@ -11,7 +11,7 @@ pub const Websocket = struct {
     state: union(enum) {
         wait_http_response: AcceptKey,
         default,
-        outstanding_data: MaskedReader,
+        outstanding_data: MessageDataReader,
     },
     rand: std.Random,
     reader: *std.Io.Reader,
@@ -31,7 +31,7 @@ pub const Websocket = struct {
     pub const PollResponse = union(enum) {
         initialized,
         redirect: []const u8,
-        frame: Frame,
+        message: Message,
         none,
     };
 
@@ -105,10 +105,10 @@ pub const Websocket = struct {
                 .default => switch (try self.pollInitialized(reader_buf)) {
                     .cont => continue,
                     .wait => return .none,
-                    .frame => |f| return .{ .frame = f },
+                    .message => |f| return .{ .message = f },
                 },
                 .outstanding_data => |*mr| {
-                    _ = try mr.inner.interface.discardRemaining();
+                    _ = try mr.reader.discardRemaining();
                     self.state = .default;
                 },
             }
@@ -122,7 +122,7 @@ pub const Websocket = struct {
         var header_it = response.header.iterateHeaders();
         var lower_buf: [128]u8 = undefined;
 
-        while (header_it.next()) |header|{
+        while (header_it.next()) |header| {
             const lower_name = std.ascii.lowerString(&lower_buf, header.name);
 
             if (std.mem.eql(u8, lower_name, "sec-websocket-accept")) {
@@ -139,7 +139,6 @@ pub const Websocket = struct {
         if (!accepted_field_present) {
             return error.NoAcceptHeader;
         }
-
     }
     pub const Op = union(enum) {
         continuation,
@@ -216,7 +215,7 @@ pub const Websocket = struct {
         }
     }
 
-    const Frame = struct {
+    const Message = struct {
         op: Op,
         data: *std.Io.Reader,
     };
@@ -253,7 +252,7 @@ pub const Websocket = struct {
     };
 
     const PollInitializedResponse = union(enum) {
-        frame: Frame,
+        message: Message,
         cont,
         wait,
     };
@@ -280,6 +279,23 @@ pub const Websocket = struct {
                 else => return e,
             };
         }
+    }
+
+    const WsHeaderPeek = struct {
+        len: usize,
+        header: WsHeader,
+    };
+    fn peekWsHeader(r: *std.Io.Reader) !WsHeaderPeek {
+        const common = try r.takeStruct(WsCommonHeader, .big);
+        const full_len = common.fullLen();
+        const full_buf = try r.peekGreedy(full_len);
+
+        var fixed = std.Io.Reader.fixed(full_buf);
+        const header = try WsHeader.read(&fixed);
+        return .{
+            .len = fixed.seek,
+            .header = header,
+        };
     }
 
     fn readRequiredInner(r: *std.Io.Reader) !RequiredData {
@@ -311,15 +327,17 @@ pub const Websocket = struct {
 
         const required = try readRequired(r);
 
-        const masked_reader = MaskedReader{
-            .inner = r.limited(.limited(required.header.len), &.{}),
+        const masked_reader = MessageDataReader{
+            .input = r,
+            .frame_len = required.header.len,
+            .is_last_frame = required.header.fin,
             .reader = .{
                 .buffer = reader_buf,
                 .seek = 0,
                 .end = 0,
                 .vtable = &.{
-                    .stream = MaskedReader.stream,
-                    .discard = MaskedReader.discard,
+                    .stream = MessageDataReader.stream,
+                    //.discard = MaskedDataReader.discard,
                 },
             },
             // Could special case missing mask for easier piping but for now does
@@ -347,43 +365,81 @@ pub const Websocket = struct {
 
         self.state = .{ .outstanding_data = masked_reader };
 
-        return .{ .frame = .{
+        return .{ .message = .{
             .op = out_op,
             .data = &self.state.outstanding_data.reader,
         } };
     }
 
-    const MaskedReader = struct {
-        inner: std.Io.Reader.Limited,
+    pub const MessageDataReader = struct {
+        input: *std.Io.Reader,
         reader: std.Io.Reader,
-        mask: MaskingKey,
+        mask: [4]u8,
         i: usize,
+        is_last_frame: bool,
+        frame_len: usize,
 
-        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-            const self: *MaskedReader = @fieldParentPtr("reader", r);
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+            const self: *MessageDataReader = @fieldParentPtr("reader", r);
 
-            const out = limit.slice(try w.writableSliceGreedy(1));
-            const read_bytes = try self.inner.interface.readSliceShort(out);
+            switch (self.readState()) {
+                .frame_start => {
+                    const header = try peekWsHeader(self.input);
+
+                    // Note that the first frame header has been processed
+                    // externally, so every frame header we see in this reader
+                    // should be a continuation frame
+                    if (header.header.op != .continuation) {
+                        return error.ReadFailed;
+                    }
+
+                    self.is_last_frame = header.header.fin;
+                    self.mask = header.header.mask;
+                    self.input.toss(header.len);
+                },
+                .end => return error.EndOfStream,
+                .mid_frame => {},
+            }
+
+            const out = try self.readFromInner(w, self.frame_len -| self.i, limit);
+            self.applyMask(out);
+
+            return out.len;
+        }
+
+        const ReadState = enum {
+            frame_start,
+            mid_frame,
+            end,
+        };
+
+        fn readState(self: MessageDataReader) ReadState {
+            const frame_finished = self.i >= self.frame_len;
+
+            if (frame_finished and self.is_last_frame) return .end;
+            if (frame_finished) return .frame_start;
+
+            return .mid_frame;
+        }
+
+        fn readFromInner(self: MessageDataReader, w: *std.Io.Writer, frame_remaining: usize, limit: std.Io.Limit) ![]u8 {
+            const combined_limit = limit.min(.limited(frame_remaining));
+            const out = combined_limit.slice(try w.writableSliceGreedy(1));
+
+            const read_bytes = try self.input.readSliceShort(out);
 
             if (read_bytes == 0) return error.EndOfStream;
 
-            for (out[0..read_bytes], self.i..) |*b, i| {
-                b.* = b.* ^ self.mask[i % self.mask.len];
-            }
-            self.i += read_bytes;
-
             w.advance(read_bytes);
 
-            return read_bytes;
+            return out[0..read_bytes];
         }
 
-        fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-            const self: *MaskedReader = @fieldParentPtr("reader", r);
-
-            const discarded = try self.inner.interface.discard(limit);
-            self.i += discarded;
-
-            return discarded;
+        fn applyMask(self: *MessageDataReader, buf: []u8) void {
+            for (buf, self.i..) |*b, i| {
+                b.* = b.* ^ self.mask[i % self.mask.len];
+            }
+            self.i += buf.len;
         }
     };
 
@@ -415,6 +471,21 @@ pub const Websocket = struct {
         rsv2: u1,
         rsv1: u1,
         fin: u1,
+
+        fn fullLen(self: WsCommonHeader) usize {
+            var len: usize = WsHeader.min_size;
+            if (self.mask == 1) {
+                len += 4;
+            }
+
+            switch (self.payload_len) {
+                126 => len += 2,
+                127 => len += 8,
+                else => {},
+            }
+
+            return len;
+        }
     };
 
     const MaskingKey = [4]u8;
@@ -513,7 +584,6 @@ pub const Websocket = struct {
             );
 
             self.ws.writer.end = 0;
-
 
             try self.rw.writeAll("HTTP/1.1 101 Switching Protocols\r\n" ++
                 "Connection: upgrade\r\n" ++
@@ -710,15 +780,12 @@ pub const Websocket = struct {
         var fixture: Fixture = undefined;
         try fixture.initPinnedNoInitResponse();
 
-        try fixture.rw.writeAll(
-            "HTTP/1.1 302 Some redirect\r\n" ++
+        try fixture.rw.writeAll("HTTP/1.1 302 Some redirect\r\n" ++
             "Location: /websocket2\r\n" ++
             "Date: Sun, 01 Feb 2026 04:22:32 GMT\r\n" ++
-            "\r\n"
-        );
+            "\r\n");
 
         fixture.reader.end = fixture.rw.end;
-
 
         const res = try fixture.ws.poll(&fixture.reader_buf);
         try std.testing.expect(res == .redirect);
@@ -729,12 +796,10 @@ pub const Websocket = struct {
         var fixture: Fixture = undefined;
         try fixture.initPinnedNoInitResponse();
 
-        try fixture.rw.writeAll(
-            "HTTP/1.1 200 OK\r\n" ++
+        try fixture.rw.writeAll("HTTP/1.1 200 OK\r\n" ++
             "Location: /websocket2\r\n" ++
             "Date: Sun, 01 Feb 2026 04:22:32 GMT\r\n" ++
-            "\r\n"
-        );
+            "\r\n");
 
         fixture.reader.end = fixture.rw.end;
 
@@ -746,12 +811,10 @@ pub const Websocket = struct {
         var fixture: Fixture = undefined;
         try fixture.initPinnedNoInitResponse();
 
-        try fixture.rw.writeAll(
-            "HTTP/1.1 101 Upgrade time\r\n" ++
+        try fixture.rw.writeAll("HTTP/1.1 101 Upgrade time\r\n" ++
             "Location: /websocket2\r\n" ++
             "Date: Sun, 01 Feb 2026 04:22:32 GMT\r\n" ++
-            "\r\n"
-        );
+            "\r\n");
 
         fixture.reader.end = fixture.rw.end;
 
@@ -763,13 +826,11 @@ pub const Websocket = struct {
         var fixture: Fixture = undefined;
         try fixture.initPinnedNoInitResponse();
 
-        try fixture.rw.writeAll(
-            "HTTP/1.1 101 Upgrade time\r\n" ++
+        try fixture.rw.writeAll("HTTP/1.1 101 Upgrade time\r\n" ++
             "Location: /websocket2\r\n" ++
             "Date: Sun, 01 Feb 2026 04:22:32 GMT\r\n" ++
             "Sec-WebSocket-Accept: hello\r\n" ++
-            "\r\n"
-        );
+            "\r\n");
 
         fixture.reader.end = fixture.rw.end;
 
@@ -781,13 +842,11 @@ pub const Websocket = struct {
         var fixture: Fixture = undefined;
         try fixture.initPinnedNoInitResponse();
 
-        try fixture.rw.writeAll(
-            "HTTP/1.1 101 Upgrade time\r\n" ++
+        try fixture.rw.writeAll("HTTP/1.1 101 Upgrade time\r\n" ++
             "Location: /websocket2\r\n" ++
             "Date: Sun, 01 Feb 2026 04:22:32 GMT\r\n" ++
             "Sec-WebSocket-Accept: mKllBAplNaSygANYWdgPLtojp5k=\r\n" ++
-            "\r\n"
-        );
+            "\r\n");
 
         fixture.reader.end = fixture.rw.end;
 
@@ -796,14 +855,12 @@ pub const Websocket = struct {
     }
 };
 
-
 pub const WsScheme = enum {
     ws,
     wss,
 
     pub fn fromUri(uri: std.Uri) !WsScheme {
         return std.meta.stringToEnum(WsScheme, uri.scheme) orelse return error.UnknownScheme;
-
     }
 };
 
@@ -837,3 +894,7 @@ pub const UriMetadata = struct {
         };
     }
 };
+
+test {
+    std.testing.refAllDeclsRecursive(@This());
+}

@@ -20,8 +20,8 @@ pub const Connection = union(enum) {
     }
 
     pub fn deinit(self: *Connection) void {
-        switch (self) {
-            inline else => |e| return e.deinit(),
+        switch (self.*) {
+            inline else => |*e| return e.deinit(),
         }
     }
 
