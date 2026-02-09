@@ -1,8 +1,12 @@
-// FIXME: Lets make a blocking example too
-
 const std = @import("std");
 const sphtud = @import("sphtud");
 const sphws = @import("sphws.zig");
+
+const id_list = struct {
+    const websocket = 1;
+    const timer = 2;
+
+};
 
 fn isWouldBlock(r: *std.net.Stream.Reader, e: anyerror) bool {
     switch (e) {
@@ -21,20 +25,15 @@ fn isWouldBlock(r: *std.net.Stream.Reader, e: anyerror) bool {
 
 const WsEcho = struct {
     ws: sphws.Websocket,
-    connection: *sphws.conn.Connection,
+    tls: *sphtud.net.TlsStream(4096, 4096),
 
     body_buf: [4096]u8,
     timer: std.posix.fd_t,
 
-    pub fn initPinned(self: *WsEcho, connection: *sphws.conn.Connection, rand: std.Random, host: []const u8, path: []const u8) !void {
-        self.connection = connection;
-
-
-        const reader = connection.reader();
-        const writer = connection.writer();
-
-        self.ws = try sphws.Websocket.init(reader, writer, host, path, rand);
-        try self.connection.flush();
+    pub fn initPinned(self: *WsEcho, loop: *sphtud.event.Loop2, conn: *sphtud.net.TlsStream(4096, 4096), rand: std.Random, host: []const u8, path: []const u8) !void {
+        self.tls = conn;
+        self.ws = try sphws.Websocket.init(conn.reader(), conn.writer(), host, path, rand);
+        try conn.flush();
 
         self.timer = try std.posix.timerfd_create(.REALTIME, .{ .NONBLOCK = true });
         const interval = std.posix.system.itimerspec {
@@ -54,52 +53,35 @@ const WsEcho = struct {
             &interval,
             null,
         );
+
+        try loop.register(.{
+            .handle = self.tls.stream.handle(),
+            .id = id_list.websocket,
+            .read = true,
+            .write = false,
+        });
+
+        try loop.register(.{
+            .handle = self.timer,
+            .id = id_list.timer,
+            .read = true,
+            .write = false,
+        });
     }
 
-    fn handlers(self: *WsEcho) [2]sphtud.event.Loop.Handler {
-        return .{
-            .{
-                .ptr = self,
-                .vtable = &.{
-                    .poll = pollWs,
-                    .close = close,
-                },
-                .fd = self.connection.streamHandle(),
-                .desired_events = .{
-                    .read = true,
-                    .write = false,
-                },
-            },
-            .{
-                .ptr = self,
-                .vtable = &.{
-                    .poll = pollTimer,
-                    .close = close,
-                },
-                .fd = self.timer,
-                .desired_events = .{
-                    .read = true,
-                    .write = true,
-                },
-            },
-        };
-    }
 
-    fn pollWs(ctx: ?*anyopaque, loop: *sphtud.event.Loop, reason: sphtud.event.PollReason) sphtud.event.Loop.PollResult {
-        _ = reason;
-        _ = loop;
-
-        const self: *WsEcho = @ptrCast(@alignCast(ctx));
-
-        while (true) {
-            self.pollWsInner() catch |e| {
-                if (isWouldBlock(self.connection.streamReader(), e)) {
-                    return .in_progress;
+    fn poll(self: *WsEcho, event: usize) !void {
+        switch (event) {
+            id_list.timer => try self.pollTimer(),
+            id_list.websocket => {
+                while (true) {
+                    self.pollWsInner() catch |e| {
+                        if (self.tls.isWouldBlock(e)) return;
+                        return e;
+                    };
                 }
-
-                std.log.err("oh no", .{});
-                return .complete;
-            };
+            },
+            else => unreachable,
         }
     }
 
@@ -110,9 +92,7 @@ const WsEcho = struct {
         // The websocket abstraction does not flush, but may try to write
         // things out. We check manually if anything was written and flush the
         // pipeline if needed
-        if (self.connection.hasBufferedData()) {
-            try self.connection.flush();
-        }
+        try self.tls.flush();
 
         switch (res) {
             .initialized => {},
@@ -128,7 +108,7 @@ const WsEcho = struct {
                 // * re-init self.ws
                 unreachable;
             },
-            .frame => |f| {
+            .message => |f| {
                 const stderr = std.fs.File.stderr();
 
                 var stderr_buf: [4096]u8 = undefined;
@@ -145,21 +125,7 @@ const WsEcho = struct {
         }
     }
 
-    fn pollTimer(ctx: ?*anyopaque, loop: *sphtud.event.Loop, reason: sphtud.event.PollReason) sphtud.event.Loop.PollResult {
-        _ = reason;
-        _ = loop;
-
-        const self: *WsEcho = @ptrCast(@alignCast(ctx));
-
-        self.pollTimerInner() catch {
-            std.log.err("uh oh\n", .{});
-            return .complete;
-        };
-
-        return .in_progress;
-    }
-
-    fn pollTimerInner(self: *WsEcho) !void{
+    fn pollTimer(self: *WsEcho) !void{
         // FIXME: Better error handling
         var count: usize = 0;
         _ = try std.posix.read(self.timer, std.mem.asBytes(&count));
@@ -171,11 +137,7 @@ const WsEcho = struct {
             std.debug.print("Cannot send yet\n", .{});
             return;
         };
-        try self.connection.flush();
-    }
-
-    fn close(_: ?*anyopaque) void {
-        // Close is handled by deinit, not by event loop
+        try self.tls.flush();
     }
 };
 
@@ -197,32 +159,28 @@ pub fn main() !void {
     var ca_bundle = std.crypto.Certificate.Bundle{};
     try ca_bundle.rescan(alloc);
 
-    const connection = try alloc.create(sphws.conn.Connection);
+    const std_stream = try std.net.tcpConnectToHost(scratch.allocator(), uri_meta.host, 443);
+    const connection = try alloc.create(sphtud.net.TlsStream(4096, 4096));
+    try connection.initPinned(std_stream, uri_meta.host, ca_bundle);
 
-    try connection.initPinned(scratch.allocator(), ca_bundle, uri_meta);
 
     std.debug.print("Connected!\n", .{});
 
-    // After the TLS handshake all blocking code has runa nd we can
-    try sphtud.event.setNonblock(connection.streamHandle());
+    // After the TLS handshake all blocking code has run
+    try sphtud.event.setNonblock(connection.handle());
+
+    var loop = try sphtud.event.Loop2.init();
 
     var ws_echo: WsEcho = undefined;
-    try ws_echo.initPinned(connection, rng.random(), uri_meta.host, uri_meta.path);
-
-    var loop = try sphtud.event.Loop.init(
-        alloc,
-        .linear(alloc),
-    );
-
-    for (ws_echo.handlers()) |handler| {
-        try loop.register(handler);
-    }
+    try ws_echo.initPinned(&loop, connection, rng.random(), uri_meta.host, uri_meta.path);
 
     std.debug.print("Running event loop\n", .{});
 
     const cp = scratch.checkpoint();
     while (true) {
         scratch.restore(cp);
-        try loop.wait(scratch);
+
+        const event = try loop.poll();
+        try ws_echo.poll(event);
     }
 }

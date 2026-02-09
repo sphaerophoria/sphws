@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         }),
     });
+    blocking_exe.root_module.addImport("sphtud", sphtud);
 
     b.installArtifact(exe);
     b.installArtifact(blocking_exe);

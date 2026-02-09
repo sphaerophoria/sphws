@@ -1,5 +1,6 @@
 const std = @import("std");
 const sphws = @import("sphws.zig");
+const sphtud = @import("sphtud");
 
 pub fn main() !void {
     // I think we waste a lot of memory building the ca_bundle, but whatever.
@@ -18,15 +19,13 @@ pub fn main() !void {
     var ca_bundle = std.crypto.Certificate.Bundle{};
     try ca_bundle.rescan(alloc);
 
-    const connection = try alloc.create(sphws.conn.Connection);
-
-    try connection.initPinned(alloc, ca_bundle, uri_meta);
+    const connection = try alloc.create(sphtud.net.TlsStream(4096, 4096));
+    const std_stream = try std.net.tcpConnectToHost(arena.allocator(), uri_meta.host, 443);
+    try connection.initPinned(std_stream, uri_meta.host, ca_bundle);
 
     std.debug.print("Connected!\n", .{});
 
-    const reader = connection.reader();
-    const writer = connection.writer();
-    var ws = try sphws.Websocket.init(reader, writer, uri_meta.host, uri_meta.path, rng.random());
+    var ws = try sphws.Websocket.init(connection.reader(), connection.writer(), uri_meta.host, uri_meta.path, rng.random());
     try connection.flush();
 
     var body_buf: [16384]u8 = undefined;
@@ -36,9 +35,7 @@ pub fn main() !void {
         // The websocket abstraction does not flush, but may try to write
         // things out. We check manually if anything was written and flush the
         // pipeline if needed
-        if (connection.hasBufferedData()) {
-            try connection.flush();
-        }
+        try connection.flush();
 
         switch (res) {
             .initialized => {
@@ -55,7 +52,7 @@ pub fn main() !void {
                 // * re-init self.ws
                 unreachable;
             },
-            .frame => |f| {
+            .message => |f| {
                 const stderr = std.fs.File.stderr();
 
                 var stderr_buf: [4096]u8 = undefined;
