@@ -344,7 +344,6 @@ pub const Websocket = struct {
             .i = 0,
         };
 
-        std.debug.print("Got message of type {t}\n", .{required.header.op});
         const out_op: Op = switch (required.header.op) {
             .continuation => .continuation,
             .text => .text,
